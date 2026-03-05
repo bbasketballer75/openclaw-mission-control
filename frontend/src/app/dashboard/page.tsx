@@ -2,7 +2,7 @@
 
 export const dynamic = "force-dynamic";
 
-import { type KeyboardEvent, type MouseEvent, useMemo } from "react";
+import { type KeyboardEvent, type MouseEvent, useCallback, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
@@ -12,9 +12,14 @@ import {
   Activity,
   ArrowUpRight,
   Bot,
+  Check,
+  ClipboardCopy,
+  ExternalLink,
   Info,
   LayoutGrid,
+  Radio,
   Shield,
+  TriangleAlert,
   Timer,
 } from "lucide-react";
 
@@ -22,7 +27,7 @@ import { DashboardSidebar } from "@/components/organisms/DashboardSidebar";
 import { DashboardShell } from "@/components/templates/DashboardShell";
 import { Markdown } from "@/components/atoms/Markdown";
 import { SignedOutPanel } from "@/components/auth/SignedOutPanel";
-import { ApiError } from "@/api/mutator";
+import { ApiError, customFetch } from "@/api/mutator";
 import {
   type dashboardMetricsApiV1MetricsDashboardGetResponse,
   useDashboardMetricsApiV1MetricsDashboardGet,
@@ -80,6 +85,30 @@ type GatewaySnapshot = GatewayTarget & {
   mainSessionError: string | null;
   error: string | null;
   requestError: string | null;
+};
+
+type RuntimeOpsStatus = "ok" | "degraded" | "unavailable";
+
+type RuntimeOpsResponse = {
+  enabled: boolean;
+  status: RuntimeOpsStatus;
+  source_url: string | null;
+  collected_at: string;
+  window_minutes: number;
+  health_ok: boolean;
+  auth_mode: string | null;
+  open_incidents_count: number;
+  errors_15m: number;
+  commands_1h: number;
+  command_failures_1h: number;
+  latest_reliability: Record<string, unknown>;
+  provider_probe: Record<string, unknown>;
+  providers: Array<Record<string, unknown>>;
+  agents: Array<Record<string, unknown>>;
+  incidents: Array<Record<string, unknown>>;
+  signatures: Array<Record<string, unknown>>;
+  live_events: Array<Record<string, unknown>>;
+  notes: string[];
 };
 
 const DASH = "—";
@@ -218,6 +247,15 @@ const formatPercent = (value: number): string =>
 const formatPerDay = (total: number, days: number): string => {
   if (!Number.isFinite(total) || !Number.isFinite(days) || days <= 0) return DASH;
   return `${(total / days).toFixed(1)}/day`;
+};
+
+const linesToAiPayload = (title: string, lines: string[]): string => {
+  const timestamp = new Date().toISOString();
+  return [
+    `Mission Control Dashboard :: ${title}`,
+    `Captured: ${timestamp}`,
+    ...lines,
+  ].join("\n");
 };
 
 const toSessionSummaries = (
@@ -411,15 +449,47 @@ function TopMetricCard({
   );
 }
 
+function SectionCopyButton({
+  sectionKey,
+  payload,
+  copiedSection,
+  onCopy,
+}: {
+  sectionKey: string;
+  payload: string;
+  copiedSection: string | null;
+  onCopy: (section: string, payload: string) => void;
+}) {
+  const copied = copiedSection === sectionKey;
+  return (
+    <button
+      type="button"
+      onClick={() => onCopy(sectionKey, payload)}
+      className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition ${
+        copied
+          ? "border-emerald-300 bg-emerald-50 text-emerald-700"
+          : "border-slate-300 bg-white text-slate-600 hover:border-slate-400 hover:text-slate-800"
+      }`}
+      title="Copy section snapshot for AI handoff"
+      aria-label="Copy section snapshot for AI handoff"
+    >
+      {copied ? <Check className="h-3.5 w-3.5" /> : <ClipboardCopy className="h-3.5 w-3.5" />}
+      {copied ? "Copied" : "Copy for AI"}
+    </button>
+  );
+}
+
 function InfoBlock({
   title,
   badge,
   infoText,
+  action,
   rows,
 }: {
   title: string;
   badge?: { text: string; tone: "online" | "offline" | "neutral" };
   infoText?: string;
+  action?: React.ReactNode;
   rows: SummaryRow[];
 }) {
   return (
@@ -435,21 +505,24 @@ function InfoBlock({
             >
               <Info className="h-3.5 w-3.5" />
             </span>
+            ) : null}
+        </div>
+        <div className="flex items-center gap-2">
+          {action}
+          {badge ? (
+            <span
+              className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                badge.tone === "online"
+                  ? "bg-emerald-100 text-emerald-700"
+                  : badge.tone === "offline"
+                    ? "bg-rose-100 text-rose-700"
+                    : "bg-slate-200 text-slate-700"
+              }`}
+            >
+              {badge.text}
+            </span>
           ) : null}
         </div>
-        {badge ? (
-          <span
-            className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${
-              badge.tone === "online"
-                ? "bg-emerald-100 text-emerald-700"
-                : badge.tone === "offline"
-                  ? "bg-rose-100 text-rose-700"
-                  : "bg-slate-200 text-slate-700"
-            }`}
-          >
-            {badge.text}
-          </span>
-        ) : null}
       </div>
       <div className="divide-y divide-slate-100 rounded-lg border border-slate-200 bg-white">
         {rows.map((row) => (
@@ -478,6 +551,42 @@ function InfoBlock({
 export default function DashboardPage() {
   const router = useRouter();
   const { isSignedIn } = useAuth();
+  const [copiedSection, setCopiedSection] = useState<string | null>(null);
+
+  const copySectionForAi = useCallback((section: string, payload: string) => {
+    const copyWithFallback = () => {
+      const textarea = document.createElement("textarea");
+      textarea.value = payload;
+      textarea.setAttribute("readonly", "true");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textarea);
+    };
+
+    const markCopied = () => {
+      setCopiedSection(section);
+      window.setTimeout(() => {
+        setCopiedSection((active) => (active === section ? null : active));
+      }, 2200);
+    };
+
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard
+        .writeText(payload)
+        .then(markCopied)
+        .catch(() => {
+          copyWithFallback();
+          markCopied();
+        });
+      return;
+    }
+
+    copyWithFallback();
+    markCopied();
+  }, []);
 
   const boardsQuery = useListBoardsApiV1BoardsGet<listBoardsApiV1BoardsGetResponse, ApiError>(
     { limit: 200 },
@@ -527,6 +636,21 @@ export default function DashboardPage() {
       },
     },
   );
+
+  const runtimeOpsQuery = useQuery<RuntimeOpsResponse, ApiError>({
+    queryKey: ["dashboard", "runtime-ops"],
+    enabled: Boolean(isSignedIn),
+    refetchInterval: 20_000,
+    refetchOnMount: "always",
+    queryFn: async () => {
+      const response = await customFetch<{
+        data: RuntimeOpsResponse;
+        status: number;
+        headers: Headers;
+      }>("/api/v1/metrics/runtime", { method: "GET" });
+      return response.data;
+    },
+  });
 
   const boards = useMemo(
     () =>
@@ -815,9 +939,175 @@ export default function DashboardPage() {
       tone: gatewayHealthErrorCount + gatewayDisconnectedCount > 0 ? "warning" : "success",
     },
   ];
+
+  const runtimeOps = runtimeOpsQuery.data ?? null;
+  const runtimeAgents = useMemo(
+    () =>
+      (runtimeOps?.agents ?? [])
+        .map(toRecord)
+        .filter(Boolean)
+        .map((record) => {
+          const health = readString(record, ["health"]) ?? "warn";
+          const normalizedHealth =
+            health === "ok" || health === "bad" || health === "warn" ? health : "warn";
+          return {
+            agentId: readString(record, ["agent_id"]) ?? "unknown",
+            health: normalizedHealth,
+            errors15m: readNumber(record, ["errors_15m"]) ?? 0,
+            events15m: readNumber(record, ["events_15m"]) ?? 0,
+            lastSeen: readTimestamp(record, ["last_seen"]),
+            lastEventType: readString(record, ["last_event_type"]) ?? DASH,
+          };
+        }),
+    [runtimeOps],
+  );
+  const runtimeSignatures = useMemo(
+    () =>
+      (runtimeOps?.signatures ?? [])
+        .map(toRecord)
+        .filter(Boolean)
+        .map((record) => ({
+          signature: readString(record, ["signature"]) ?? "unknown signature",
+          source: readString(record, ["source"]) ?? "unknown source",
+          category: readString(record, ["category"]) ?? "unknown",
+          provider: readString(record, ["provider"]) ?? "unknown",
+          count: readNumber(record, ["count"]) ?? 0,
+          sample: readString(record, ["sample"]) ?? DASH,
+        })),
+    [runtimeOps],
+  );
+  const runtimeLiveEvents = useMemo(
+    () =>
+      (runtimeOps?.live_events ?? [])
+        .map(toRecord)
+        .filter(Boolean)
+        .map((record) => ({
+          ts: readTimestamp(record, ["ts"]),
+          source: readString(record, ["source"]) ?? "unknown",
+          eventType: readString(record, ["event_type"]) ?? "event",
+          severity: readString(record, ["severity"]) ?? "info",
+          agentId: readString(record, ["agent_id"]),
+        })),
+    [runtimeOps],
+  );
+
+  const runtimeStatusLabel = !runtimeOps
+    ? runtimeOpsQuery.isLoading
+      ? "Loading"
+      : "Unavailable"
+    : runtimeOps.status === "ok"
+      ? "Healthy"
+      : runtimeOps.status === "degraded"
+        ? "Degraded"
+        : "Unavailable";
+  const runtimeBadgeTone: "online" | "offline" | "neutral" =
+    runtimeStatusLabel === "Healthy"
+      ? "online"
+      : runtimeStatusLabel === "Degraded" || runtimeStatusLabel === "Unavailable"
+        ? "offline"
+        : "neutral";
+  const runtimeBadAgentCount = runtimeAgents.filter((agent) => agent.health === "bad").length;
+  const runtimeWarnAgentCount = runtimeAgents.filter((agent) => agent.health === "warn").length;
+  const runtimeHealthyAgentCount = runtimeAgents.filter((agent) => agent.health === "ok").length;
+  const runtimeProviderProbe = toRecord(runtimeOps?.provider_probe ?? null);
+  const providerProbePass = readNumber(runtimeProviderProbe, ["pass_count"]) ?? 0;
+  const providerProbeTotal = readNumber(runtimeProviderProbe, ["total"]) ?? 0;
+  const providerProbeTime = readTimestamp(runtimeProviderProbe, ["time"]);
+  const runtimeNotes = runtimeOps?.notes ?? [];
+  const runtimeSourceUrl = runtimeOps?.source_url ?? null;
+
+  const workloadSharePayload = useMemo(
+    () =>
+      linesToAiPayload(
+        "Workload",
+        workloadRows.map((row) => `${row.label}: ${row.value}`),
+      ),
+    [workloadRows],
+  );
+  const throughputSharePayload = useMemo(
+    () =>
+      linesToAiPayload(
+        "Throughput",
+        throughputRows.map((row) => `${row.label}: ${row.value}`),
+      ),
+    [throughputRows],
+  );
+  const gatewaySharePayload = useMemo(
+    () =>
+      linesToAiPayload(
+        "Gateway Health",
+        gatewayRows.map((row) => `${row.label}: ${row.value}`),
+      ),
+    [gatewayRows],
+  );
+
   const pendingApprovalItems = metrics?.pending_approvals.items ?? [];
   const pendingApprovalsTotal = metrics?.pending_approvals.total ?? 0;
   const hasPendingApprovals = pendingApprovalItems.length > 0;
+  const pendingApprovalsSharePayload = useMemo(
+    () =>
+      linesToAiPayload("Pending Approvals", [
+        `Total pending approvals: ${formatCount(pendingApprovalsTotal)}`,
+        ...pendingApprovalItems.slice(0, 10).map((item) => {
+          const title = item.task_title?.trim() || "Pending approval";
+          return `- ${item.board_name}: ${title} | confidence=${item.confidence}% | created=${item.created_at}`;
+        }),
+      ]),
+    [pendingApprovalItems, pendingApprovalsTotal],
+  );
+
+  const sessionsSharePayload = useMemo(
+    () =>
+      linesToAiPayload("Sessions", [
+        `Active sessions: ${formatCount(activeSessions)}`,
+        `Configured gateways: ${formatCount(gatewayTargets.length)}`,
+        `Connected gateways: ${formatCount(gatewayConnectedCount)}`,
+        ...sessionSummaries.slice(0, 12).map(
+          (session) =>
+            `- ${session.title} | ${session.subtitle} | usage=${session.usage} | last_seen=${session.lastSeenAt ?? "unknown"}`,
+        ),
+      ]),
+    [activeSessions, gatewayConnectedCount, gatewayTargets.length, sessionSummaries],
+  );
+
+  const recentActivitySharePayload = useMemo(
+    () =>
+      linesToAiPayload("Recent Activity", [
+        `Activity events shown: ${formatCount(recentLogs.length)}`,
+        ...recentLogs.map(
+          (event) =>
+            `- ${event.event_type} | ${event.created_at} | ${(event.message ?? event.event_type).trim().slice(0, 180)}`,
+        ),
+      ]),
+    [recentLogs],
+  );
+
+  const runtimeSharePayload = useMemo(
+    () =>
+      linesToAiPayload("Runtime Ops", [
+        `Status: ${runtimeStatusLabel}`,
+        `Source URL: ${runtimeSourceUrl ?? "not configured"}`,
+        `Open incidents: ${formatCount(runtimeOps?.open_incidents_count ?? 0)}`,
+        `Errors (15m): ${formatCount(runtimeOps?.errors_15m ?? 0)}`,
+        `Commands (1h): ${formatCount(runtimeOps?.commands_1h ?? 0)}`,
+        `Command failures (1h): ${formatCount(runtimeOps?.command_failures_1h ?? 0)}`,
+        `Agents healthy/warn/bad: ${formatCount(runtimeHealthyAgentCount)}/${formatCount(runtimeWarnAgentCount)}/${formatCount(runtimeBadAgentCount)}`,
+        ...runtimeSignatures.slice(0, 8).map(
+          (item) =>
+            `- ${item.provider}/${item.category} (${item.count}) :: ${item.sample.slice(0, 160)}`,
+        ),
+      ]),
+    [
+      runtimeBadAgentCount,
+      runtimeHealthyAgentCount,
+      runtimeOps,
+      runtimeSignatures,
+      runtimeSourceUrl,
+      runtimeStatusLabel,
+      runtimeWarnAgentCount,
+    ],
+  );
+
   const activityFeedHref = "/activity";
 
   const shouldIgnoreRowNavigation = (target: EventTarget | null): boolean => {
@@ -905,6 +1195,11 @@ export default function DashboardPage() {
                 {metricsQuery.error.message}
               </div>
             ) : null}
+            {runtimeOpsQuery.error ? (
+              <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
+                Runtime telemetry bridge is temporarily unavailable: {runtimeOpsQuery.error.message}
+              </div>
+            ) : null}
 
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
               <TopMetricCard
@@ -941,15 +1236,39 @@ export default function DashboardPage() {
             <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
               <InfoBlock
                 title="Workload"
+                action={
+                  <SectionCopyButton
+                    sectionKey="workload"
+                    payload={workloadSharePayload}
+                    copiedSection={copiedSection}
+                    onCopy={copySectionForAi}
+                  />
+                }
                 rows={workloadRows}
               />
               <InfoBlock
                 title="Throughput"
                 infoText={`All throughput values are calculated for ${DASHBOARD_RANGE_LABEL}`}
+                action={
+                  <SectionCopyButton
+                    sectionKey="throughput"
+                    payload={throughputSharePayload}
+                    copiedSection={copiedSection}
+                    onCopy={copySectionForAi}
+                  />
+                }
                 rows={throughputRows}
               />
               <InfoBlock
                 title="Gateway Health"
+                action={
+                  <SectionCopyButton
+                    sectionKey="gateway-health"
+                    payload={gatewaySharePayload}
+                    copiedSection={copiedSection}
+                    onCopy={copySectionForAi}
+                  />
+                }
                 badge={{
                   text: gatewayStatusLabel,
                   tone: gatewayBadgeTone,
@@ -958,16 +1277,193 @@ export default function DashboardPage() {
               />
             </div>
 
+            <section className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-6 text-slate-100 shadow-sm">
+              <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-lg font-semibold tracking-tight text-white">Runtime Operations</h3>
+                    <span
+                      className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                        runtimeBadgeTone === "online"
+                          ? "bg-emerald-500/20 text-emerald-200"
+                          : runtimeBadgeTone === "offline"
+                            ? "bg-rose-500/20 text-rose-200"
+                            : "bg-slate-500/30 text-slate-200"
+                      }`}
+                    >
+                      <Radio className="mr-1 h-3 w-3" />
+                      {runtimeStatusLabel}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-slate-300">
+                    Bridged from local OpenClaw ops telemetry with fresh tail events.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <SectionCopyButton
+                    sectionKey="runtime-ops"
+                    payload={runtimeSharePayload}
+                    copiedSection={copiedSection}
+                    onCopy={copySectionForAi}
+                  />
+                  {runtimeSourceUrl ? (
+                    <a
+                      href={runtimeSourceUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-500/70 bg-slate-700/40 px-2 py-1 text-[11px] font-medium text-slate-200 transition hover:border-slate-400 hover:text-white"
+                    >
+                      Open source
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </a>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                <div className="rounded-xl border border-slate-600/60 bg-slate-900/35 p-3">
+                  <p className="text-[11px] uppercase tracking-wider text-slate-300">Open Incidents</p>
+                  <p className="mt-1 text-2xl font-semibold text-white">
+                    {formatCount(runtimeOps?.open_incidents_count ?? 0)}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-600/60 bg-slate-900/35 p-3">
+                  <p className="text-[11px] uppercase tracking-wider text-slate-300">Errors (15m)</p>
+                  <p className="mt-1 text-2xl font-semibold text-white">{formatCount(runtimeOps?.errors_15m ?? 0)}</p>
+                </div>
+                <div className="rounded-xl border border-slate-600/60 bg-slate-900/35 p-3">
+                  <p className="text-[11px] uppercase tracking-wider text-slate-300">Agents (ok/warn/bad)</p>
+                  <p className="mt-1 text-2xl font-semibold text-white">
+                    {formatCount(runtimeHealthyAgentCount)}/{formatCount(runtimeWarnAgentCount)}/
+                    {formatCount(runtimeBadAgentCount)}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-600/60 bg-slate-900/35 p-3">
+                  <p className="text-[11px] uppercase tracking-wider text-slate-300">Provider Probe</p>
+                  <p className="mt-1 text-2xl font-semibold text-white">
+                    {formatCount(providerProbePass)}/{formatCount(providerProbeTotal)}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-300">
+                    {providerProbeTime ? formatRelativeTimestamp(providerProbeTime) : "No probe timestamp"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-3">
+                <section className="rounded-xl border border-slate-600/60 bg-slate-900/35 p-3">
+                  <h4 className="text-sm font-semibold text-white">Hot Agents</h4>
+                  <div className="mt-2 space-y-2">
+                    {runtimeAgents.slice(0, 6).map((agent) => (
+                      <div
+                        key={agent.agentId}
+                        className="flex items-center justify-between gap-2 rounded-lg border border-slate-700/70 bg-slate-950/20 px-2 py-1.5"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-medium text-slate-100">{agent.agentId}</p>
+                          <p className="truncate text-[11px] text-slate-300">{agent.lastEventType}</p>
+                        </div>
+                        <div className="shrink-0 text-right text-[11px]">
+                          <p
+                            className={
+                              agent.health === "bad"
+                                ? "text-rose-300"
+                                : agent.health === "warn"
+                                  ? "text-amber-300"
+                                  : "text-emerald-300"
+                            }
+                          >
+                            e15m {formatCount(agent.errors15m)}
+                          </p>
+                          <p className="text-slate-300">{agent.lastSeen ? formatRelativeTimestamp(agent.lastSeen) : DASH}</p>
+                        </div>
+                      </div>
+                    ))}
+                    {runtimeAgents.length === 0 ? (
+                      <p className="text-xs text-slate-300">No agent telemetry available yet.</p>
+                    ) : null}
+                  </div>
+                </section>
+
+                <section className="rounded-xl border border-slate-600/60 bg-slate-900/35 p-3">
+                  <h4 className="text-sm font-semibold text-white">Top Error Signatures</h4>
+                  <div className="mt-2 space-y-2">
+                    {runtimeSignatures.slice(0, 6).map((item) => (
+                      <div
+                        key={`${item.source}-${item.signature}`}
+                        className="rounded-lg border border-slate-700/70 bg-slate-950/20 px-2 py-1.5"
+                      >
+                        <p className="truncate text-xs font-medium text-slate-100">
+                          {item.provider} · {item.category} · {formatCount(item.count)}
+                        </p>
+                        <p className="truncate text-[11px] text-slate-300">{item.sample}</p>
+                      </div>
+                    ))}
+                    {runtimeSignatures.length === 0 ? (
+                      <p className="text-xs text-slate-300">No recurring signatures in this window.</p>
+                    ) : null}
+                  </div>
+                </section>
+
+                <section className="rounded-xl border border-slate-600/60 bg-slate-900/35 p-3">
+                  <h4 className="text-sm font-semibold text-white">Fresh Live Feed</h4>
+                  <div className="mt-2 space-y-2">
+                    {runtimeLiveEvents.slice(0, 6).map((event) => (
+                      <div
+                        key={`${event.ts ?? "na"}-${event.source}-${event.eventType}`}
+                        className="rounded-lg border border-slate-700/70 bg-slate-950/20 px-2 py-1.5"
+                      >
+                        <p className="truncate text-xs font-medium text-slate-100">
+                          {event.eventType} · {event.severity}
+                        </p>
+                        <p className="truncate text-[11px] text-slate-300">
+                          {event.source}
+                          {event.agentId ? ` · ${event.agentId}` : ""}
+                        </p>
+                        <p className="text-[11px] text-slate-400">
+                          {event.ts ? formatRelativeTimestamp(event.ts) : DASH}
+                        </p>
+                      </div>
+                    ))}
+                    {runtimeLiveEvents.length === 0 ? (
+                      <p className="text-xs text-slate-300">No recent live events yet.</p>
+                    ) : null}
+                  </div>
+                </section>
+              </div>
+
+              {runtimeNotes.length > 0 ? (
+                <div className="mt-3 rounded-lg border border-amber-400/30 bg-amber-500/10 p-3 text-xs text-amber-100">
+                  <p className="mb-1 inline-flex items-center gap-1 font-semibold">
+                    <TriangleAlert className="h-3.5 w-3.5" />
+                    Bridge notes
+                  </p>
+                  <ul className="space-y-1">
+                    {runtimeNotes.slice(0, 4).map((note) => (
+                      <li key={note}>- {note}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </section>
+
             <section className="mt-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
               <div className="mb-3 flex items-center justify-between gap-3">
                 <h3 className="text-lg font-semibold text-slate-900">Pending Approvals</h3>
-                <Link
-                  href="/approvals"
-                  className="inline-flex items-center gap-1 text-xs text-slate-500 transition hover:text-slate-700"
-                >
-                  Open global approvals
-                  <ArrowUpRight className="h-3.5 w-3.5" />
-                </Link>
+                <div className="flex items-center gap-2">
+                  <SectionCopyButton
+                    sectionKey="pending-approvals"
+                    payload={pendingApprovalsSharePayload}
+                    copiedSection={copiedSection}
+                    onCopy={copySectionForAi}
+                  />
+                  <Link
+                    href="/approvals"
+                    className="inline-flex items-center gap-1 text-xs text-slate-500 transition hover:text-slate-700"
+                  >
+                    Open global approvals
+                    <ArrowUpRight className="h-3.5 w-3.5" />
+                  </Link>
+                </div>
               </div>
 
               {!metrics && metricsQuery.isLoading ? (
@@ -1019,7 +1515,15 @@ export default function DashboardPage() {
               <section className="min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <h3 className="text-lg font-semibold text-slate-900">Sessions</h3>
-                  <span className="text-xs text-slate-500">{formatCount(activeSessions)}</span>
+                  <div className="flex items-center gap-2">
+                    <SectionCopyButton
+                      sectionKey="sessions"
+                      payload={sessionsSharePayload}
+                      copiedSection={copiedSection}
+                      onCopy={copySectionForAi}
+                    />
+                    <span className="text-xs text-slate-500">{formatCount(activeSessions)}</span>
+                  </div>
                 </div>
                 <div className="max-h-[310px] space-y-2 overflow-x-hidden overflow-y-auto pr-1">
                   {!hasConfiguredGateways ? (
@@ -1085,13 +1589,21 @@ export default function DashboardPage() {
               <section className="min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <h3 className="text-lg font-semibold text-slate-900">Recent Activity</h3>
-                  <Link
-                    href={activityFeedHref}
-                    className="inline-flex items-center gap-1 text-xs text-slate-500 transition hover:text-slate-700"
-                  >
-                    Open feed
-                    <ArrowUpRight className="h-3.5 w-3.5" />
-                  </Link>
+                  <div className="flex items-center gap-2">
+                    <SectionCopyButton
+                      sectionKey="recent-activity"
+                      payload={recentActivitySharePayload}
+                      copiedSection={copiedSection}
+                      onCopy={copySectionForAi}
+                    />
+                    <Link
+                      href={activityFeedHref}
+                      className="inline-flex items-center gap-1 text-xs text-slate-500 transition hover:text-slate-700"
+                    >
+                      Open feed
+                      <ArrowUpRight className="h-3.5 w-3.5" />
+                    </Link>
+                  </div>
                 </div>
                 <div className="max-h-[310px] space-y-2 overflow-x-hidden overflow-y-auto pr-1">
                   {recentLogs.length > 0 ? (

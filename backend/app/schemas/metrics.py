@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
-from sqlmodel import SQLModel
+from sqlmodel import Field, SQLModel
 
 RUNTIME_ANNOTATION_TYPES = (datetime, UUID)
 DashboardRangeKey = Literal["24h", "3d", "7d", "14d", "1m", "3m", "6m", "1y"]
@@ -103,3 +103,27 @@ class DashboardMetrics(SQLModel):
     error_rate: DashboardSeriesSet
     wip: DashboardWipSeriesSet
     pending_approvals: DashboardPendingApprovals
+
+
+class RuntimeOpsMetrics(SQLModel):
+    """Runtime telemetry bridge payload used by Mission Control dashboard."""
+
+    enabled: bool
+    status: Literal["ok", "degraded", "unavailable"]
+    source_url: str | None = None
+    collected_at: datetime
+    window_minutes: int
+    health_ok: bool = False
+    auth_mode: str | None = None
+    open_incidents_count: int = 0
+    errors_15m: int = 0
+    commands_1h: int = 0
+    command_failures_1h: int = 0
+    latest_reliability: dict[str, Any] = Field(default_factory=dict)
+    provider_probe: dict[str, Any] = Field(default_factory=dict)
+    providers: list[dict[str, Any]] = Field(default_factory=list)
+    agents: list[dict[str, Any]] = Field(default_factory=list)
+    incidents: list[dict[str, Any]] = Field(default_factory=list)
+    signatures: list[dict[str, Any]] = Field(default_factory=list)
+    live_events: list[dict[str, Any]] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)

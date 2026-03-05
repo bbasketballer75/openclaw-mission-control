@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any, Literal
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import DateTime, case
 from sqlalchemy import cast as sql_cast
@@ -14,6 +16,7 @@ from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.api.deps import require_org_member
+from app.core.config import settings
 from app.core.time import utcnow
 from app.db.session import get_session
 from app.models.activity_events import ActivityEvent
@@ -29,6 +32,7 @@ from app.schemas.metrics import (
     DashboardPendingApprovals,
     DashboardRangeKey,
     DashboardRangeSeries,
+    RuntimeOpsMetrics,
     DashboardSeriesPoint,
     DashboardSeriesSet,
     DashboardWipPoint,
@@ -46,6 +50,13 @@ BOARD_ID_QUERY = Query(default=None)
 GROUP_ID_QUERY = Query(default=None)
 SESSION_DEP = Depends(get_session)
 ORG_MEMBER_DEP = Depends(require_org_member)
+RUNTIME_WINDOW_QUERY = Query(
+    default=settings.runtime_ops_default_window_minutes,
+    ge=15,
+    le=24 * 60,
+)
+RUNTIME_EVENT_LIMIT_QUERY = Query(default=settings.runtime_ops_default_event_limit, ge=5, le=250)
+RUNTIME_AGENTS_LIMIT_QUERY = Query(default=18, ge=3, le=200)
 
 
 @dataclass(frozen=True)
@@ -548,4 +559,240 @@ async def dashboard_metrics(
         error_rate=error_rate,
         wip=wip,
         pending_approvals=pending_approvals,
+    )
+
+
+def _runtime_safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except ValueError:
+            return default
+    return default
+
+
+def _runtime_safe_str(value: Any) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else None
+    return None
+
+
+def _runtime_safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _runtime_safe_dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+async def _runtime_fetch_json(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        response = await client.get(url, params=params)
+    except httpx.HTTPError as exc:
+        return None, f"{url} request failed: {exc}"
+
+    if response.status_code != status.HTTP_200_OK:
+        detail = response.text.strip()
+        detail_text = f" ({detail[:200]})" if detail else ""
+        return None, f"{url} returned {response.status_code}{detail_text}"
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, f"{url} returned invalid JSON"
+
+    if not isinstance(payload, dict):
+        return None, f"{url} returned non-object JSON"
+    return payload, None
+
+
+def _runtime_agent_health(agent: dict[str, Any]) -> str:
+    errors_15m = _runtime_safe_int(agent.get("errors_15m"))
+    events_15m = _runtime_safe_int(agent.get("events_15m"))
+    if errors_15m > 0:
+        return "bad"
+    if events_15m == 0:
+        return "warn"
+    return "ok"
+
+
+@router.get("/runtime", response_model=RuntimeOpsMetrics)
+async def runtime_metrics(
+    window_minutes: int = RUNTIME_WINDOW_QUERY,
+    event_limit: int = RUNTIME_EVENT_LIMIT_QUERY,
+    agents_limit: int = RUNTIME_AGENTS_LIMIT_QUERY,
+    _: AsyncSession = SESSION_DEP,
+    __: OrganizationContext = ORG_MEMBER_DEP,
+) -> RuntimeOpsMetrics:
+    """Return runtime telemetry bridged from the local OpenClaw ops dashboard API."""
+    source_url = settings.runtime_ops_source_url
+    collected_at = utcnow()
+    if not source_url:
+        return RuntimeOpsMetrics(
+            enabled=False,
+            status="unavailable",
+            source_url=None,
+            collected_at=collected_at,
+            window_minutes=window_minutes,
+            notes=[
+                "Runtime bridge is disabled. Set RUNTIME_OPS_SOURCE_URL to enable live OpenClaw telemetry.",
+            ],
+        )
+
+    headers = {"User-Agent": "openclaw-mission-control/1.0"}
+    if settings.runtime_ops_read_token.strip():
+        headers["Authorization"] = f"Bearer {settings.runtime_ops_read_token.strip()}"
+
+    timeout = httpx.Timeout(
+        timeout=settings.runtime_ops_timeout_seconds,
+        connect=min(settings.runtime_ops_timeout_seconds, 5.0),
+    )
+    notes: list[str] = []
+
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+        health_payload, health_error = await _runtime_fetch_json(client, f"{source_url}/health")
+        if health_error:
+            notes.append(health_error)
+
+        auth_payload, auth_error = await _runtime_fetch_json(
+            client,
+            f"{source_url}/api/v1/auth/status",
+        )
+        if auth_error:
+            notes.append(auth_error)
+
+        overview_payload, overview_error = await _runtime_fetch_json(
+            client,
+            f"{source_url}/api/v1/ops/overview",
+        )
+        if overview_error:
+            notes.append(overview_error)
+
+        agents_payload, agents_error = await _runtime_fetch_json(
+            client,
+            f"{source_url}/api/v1/agents/status",
+            params={"limit": agents_limit},
+        )
+        if agents_error:
+            notes.append(agents_error)
+
+        signatures_payload, signatures_error = await _runtime_fetch_json(
+            client,
+            f"{source_url}/api/v1/errors/signatures",
+            params={"window_minutes": window_minutes, "limit": 12},
+        )
+        if signatures_error:
+            notes.append(signatures_error)
+
+        live_probe_payload, live_probe_error = await _runtime_fetch_json(
+            client,
+            f"{source_url}/api/v1/live/events",
+            params={"after": 0, "limit": 1},
+        )
+        if live_probe_error:
+            notes.append(live_probe_error)
+
+        live_events_payload: dict[str, Any] | None = None
+        if live_probe_payload:
+            probe_window = _runtime_safe_dict(live_probe_payload.get("window"))
+            window_max = _runtime_safe_int(probe_window.get("max"))
+            recent_after = max(0, window_max - event_limit)
+            live_events_payload, live_events_error = await _runtime_fetch_json(
+                client,
+                f"{source_url}/api/v1/live/events",
+                params={"after": recent_after, "limit": event_limit},
+            )
+            if live_events_error:
+                notes.append(live_events_error)
+
+    overview = _runtime_safe_dict(overview_payload)
+    latest_reliability = _runtime_safe_dict(overview.get("latest_reliability"))
+    incidents = _runtime_safe_dict_list(overview.get("open_incidents"))[:8]
+    open_incidents_count = _runtime_safe_int(overview.get("open_incidents_count"))
+    errors_15m = _runtime_safe_int(overview.get("errors_15m"))
+    commands_1h = _runtime_safe_int(overview.get("commands_1h"))
+    command_failures_1h = _runtime_safe_int(overview.get("command_failures_1h"))
+
+    agents_raw = _runtime_safe_dict_list(_runtime_safe_dict(agents_payload).get("agents"))
+    agents: list[dict[str, Any]] = []
+    for agent in agents_raw:
+        agent_out = {
+            "agent_id": _runtime_safe_str(agent.get("agent_id")) or "unknown",
+            "last_seen": _runtime_safe_str(agent.get("last_seen")),
+            "events_15m": _runtime_safe_int(agent.get("events_15m")),
+            "errors_15m": _runtime_safe_int(agent.get("errors_15m")),
+            "last_event_type": _runtime_safe_str(agent.get("last_event_type")),
+            "last_severity": _runtime_safe_str(agent.get("last_severity")),
+            "last_run_id": _runtime_safe_str(agent.get("last_run_id")),
+            "last_session_id": _runtime_safe_str(agent.get("last_session_id")),
+            "health": _runtime_agent_health(agent),
+        }
+        agents.append(agent_out)
+    agents.sort(
+        key=lambda item: (
+            _runtime_safe_int(item.get("errors_15m"), 0),
+            _runtime_safe_int(item.get("events_15m"), 0),
+        ),
+        reverse=True,
+    )
+
+    signatures_data = _runtime_safe_dict(signatures_payload)
+    signatures = _runtime_safe_dict_list(signatures_data.get("signatures"))[:12]
+    providers = _runtime_safe_dict_list(signatures_data.get("providers"))[:10]
+    provider_probe = _runtime_safe_dict(signatures_data.get("provider_probe"))
+
+    live_events_source = live_events_payload or live_probe_payload or {}
+    live_events = _runtime_safe_dict_list(live_events_source.get("events"))
+    live_events = list(reversed(live_events[-event_limit:]))
+
+    health_ok = bool(_runtime_safe_dict(health_payload).get("ok"))
+    auth_mode = _runtime_safe_str(_runtime_safe_dict(auth_payload).get("mode"))
+
+    runtime_status: Literal["ok", "degraded", "unavailable"]
+    if not any([overview_payload, agents_payload, signatures_payload, live_events_payload]):
+        runtime_status = "unavailable"
+    elif (
+        not health_ok
+        or open_incidents_count > 0
+        or any(agent.get("health") == "bad" for agent in agents)
+        or len(notes) > 0
+    ):
+        runtime_status = "degraded"
+    else:
+        runtime_status = "ok"
+
+    return RuntimeOpsMetrics(
+        enabled=True,
+        status=runtime_status,
+        source_url=source_url,
+        collected_at=collected_at,
+        window_minutes=window_minutes,
+        health_ok=health_ok,
+        auth_mode=auth_mode,
+        open_incidents_count=open_incidents_count,
+        errors_15m=errors_15m,
+        commands_1h=commands_1h,
+        command_failures_1h=command_failures_1h,
+        latest_reliability=latest_reliability,
+        provider_probe=provider_probe,
+        providers=providers,
+        agents=agents,
+        incidents=incidents,
+        signatures=signatures,
+        live_events=live_events,
+        notes=notes,
     )

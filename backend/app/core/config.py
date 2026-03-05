@@ -70,6 +70,13 @@ class Settings(BaseSettings):
     # OpenClaw gateway runtime compatibility
     gateway_min_version: str = "2026.02.9"
 
+    # Optional runtime telemetry bridge (reads from local OpenClaw ops dashboard API).
+    runtime_ops_source_url: str = ""
+    runtime_ops_read_token: str = ""
+    runtime_ops_timeout_seconds: float = Field(default=4.0, gt=0.1, le=30.0)
+    runtime_ops_default_window_minutes: int = Field(default=180, ge=15, le=24 * 60)
+    runtime_ops_default_event_limit: int = Field(default=40, ge=5, le=250)
+
     # Logging
     log_level: str = "INFO"
     log_format: str = "text"
@@ -103,6 +110,17 @@ class Settings(BaseSettings):
                 "BASE_URL must be an absolute http(s) URL (e.g. http://localhost:8000).",
             )
         self.base_url = base_url.rstrip("/")
+        runtime_source = self.runtime_ops_source_url.strip()
+        if runtime_source:
+            parsed_runtime_source = urlparse(runtime_source)
+            if (
+                parsed_runtime_source.scheme not in {"http", "https"}
+                or not parsed_runtime_source.netloc
+            ):
+                raise ValueError(
+                    "RUNTIME_OPS_SOURCE_URL must be an absolute http(s) URL when set.",
+                )
+            self.runtime_ops_source_url = runtime_source.rstrip("/")
         # In dev, default to applying Alembic migrations at startup to avoid
         # schema drift (e.g. missing newly-added columns).
         if "db_auto_migrate" not in self.model_fields_set and self.environment == "dev":
